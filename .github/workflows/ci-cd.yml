@@ -1,0 +1,122 @@
+name: CI/CD RefCard02 (Build, Test, Deploy)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: refcard02
+
+jobs:
+  # ---------------------------------------------------------------
+  # 1) Build + Unit-Tests mit npm
+  # ---------------------------------------------------------------
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node.js 20 einrichten
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Abhängigkeiten installieren
+        run: npm ci
+
+      - name: Unit-Tests (Jest)
+        run: npm test -- --watchAll=false
+        env:
+          CI: true
+
+      - name: Production-Build
+        run: npm run build
+
+      - name: Build als Artefakt speichern
+        uses: actions/upload-artifact@v4
+        with:
+          name: refcard02-build
+          path: build/
+
+  # ---------------------------------------------------------------
+  # 2) Docker-Image bauen, Container testen, nach Docker Hub + ghcr pushen
+  # ---------------------------------------------------------------
+  docker:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # nötig für Push nach ghcr.io
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Image-Namen bestimmen (Registry-Namen müssen klein geschrieben sein)
+        run: |
+          echo "DOCKERHUB_IMAGE=docker.io/$(echo '${{ secrets.DOCKERHUB_USERNAME }}' | tr '[:upper:]' '[:lower:]')/${IMAGE_NAME}" >> $GITHUB_ENV
+          echo "GHCR_IMAGE=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Docker Buildx einrichten
+        uses: docker/setup-buildx-action@v3
+
+      - name: Docker-Image bauen
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true          # Image lokal behalten, damit es getestet werden kann
+          push: false
+          tags: |
+            ${{ env.DOCKERHUB_IMAGE }}:latest
+            ${{ env.DOCKERHUB_IMAGE }}:${{ github.sha }}
+            ${{ env.GHCR_IMAGE }}:latest
+            ${{ env.GHCR_IMAGE }}:${{ github.sha }}
+
+      - name: Container starten und testen (Smoke-Test)
+        run: |
+          docker run -d --name refcard02-test -p 8080:80 ${DOCKERHUB_IMAGE}:latest
+          for i in $(seq 1 15); do
+            if curl -fs http://localhost:8080/ > /tmp/index.html; then break; fi
+            echo "warte auf nginx... ($i)"; sleep 2
+          done
+          grep -q '<div id="root">' /tmp/index.html
+          echo "Smoke-Test erfolgreich"
+
+      - name: Container-Logs bei Fehler
+        if: failure()
+        run: docker logs refcard02-test || true
+
+      # Nur auf main deployen (nicht bei Pull Requests)
+      - name: Login Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push nach Docker Hub
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push ${DOCKERHUB_IMAGE}:latest
+          docker push ${DOCKERHUB_IMAGE}:${{ github.sha }}
+
+      # Zusatzaufgabe: zusätzlich in die GitHub Container Registry
+      - name: Login GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push nach ghcr.io
+        if: github.event_name != 'pull_request'
+        run: |
+          docker push ${GHCR_IMAGE}:latest
+          docker push ${GHCR_IMAGE}:${{ github.sha }}
